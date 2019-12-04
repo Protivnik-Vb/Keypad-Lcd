@@ -1,0 +1,503 @@
+--------------------------------------------------------------------------------
+--
+--   FileName:         pmod_keypad.vhd
+--   Dependencies:     debounce.vhd ,lcd_controller,mcg clock (Version 1.0), lcd_controller.vhd (Version 1.0)
+--   Design Software:  Ise Design 14.7 Edition
+--
+--   HDL CODE IS PROVIDED "AS IS."  DIGI-KEY EXPRESSLY DISCLAIMS ANY
+--   WARRANTY OF ANY KIND, WHETHER EXPRESS OR IMPLIED, INCLUDING BUT NOT
+--   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+--   PARTICULAR PURPOSE, OR NON-INFRINGEMENT. IN NO EVENT SHALL DIGI-KEY
+--   BE LIABLE FOR ANY INCIDENTAL, SPECIAL, INDIRECT OR CONSEQUENTIAL
+--   DAMAGES, LOST PROFITS OR LOST DATA, HARM TO YOUR EQUIPMENT, COST OF
+--   PROCUREMENT OF SUBSTITUTE GOODS, TECHNOLOGY OR SERVICES, ANY CLAIMS
+--   BY THIRD PARTIES (INCLUDING BUT NOT LIMITED TO ANY DEFENSE THEREOF),
+--   ANY CLAIMS FOR INDEMNITY OR CONTRIBUTION, OR OTHER SIMILAR COSTS.
+--
+--   Version History
+--   Version 1.0  Vineeth Babu 19/11/2019
+--     Initial Public Release
+-- 
+--------------------------------------------------------------------------------
+
+LIBRARY ieee;
+USE ieee.std_logic_1164.all;
+use ieee.std_logic_unsigned.all;
+use ieee.std_logic_arith.all;
+
+ENTITY pmod_keypad IS
+  GENERIC(
+    clk_freq       : INTEGER := 50_000_000;  --system clock frequency in Hz
+    stable_time 	 : INTEGER := 10);         --time pressed key must remain stable in ms
+  PORT(
+		clk_in       : IN  STD_LOGIC;                           --system clock
+		reset_n      : IN  STD_LOGIC;                           --asynchornous active-low reset
+		rows         : IN  STD_LOGIC_VECTOR(1 TO 2);            --row connections to keypad
+		columns 		 : BUFFER STD_LOGIC_VECTOR(1 TO 6) := "111111";  --column connections to keypad
+		lcd_e        : out std_logic;									--lcdEnable
+		lcd_rs       : out std_logic;									--lcd commnad amd data
+		lcd_rw       : out std_logic;									--lcd read and write
+		key_pll      : IN  STD_LOGIC;
+		lcd_db       : out std_logic_vector(7 downto 0)			--lcd data7 to 0
+	
+	 );          --resultant key presses
+END pmod_keypad;
+
+ARCHITECTURE logic OF pmod_keypad IS
+  SIGNAL rows_int    : STD_LOGIC_VECTOR(1 TO 2);                      --synchronizer flip-flops for row inputs
+  SIGNAL keys_int    : STD_LOGIC_VECTOR(0 TO 11) := (OTHERS => '0');  --stores key presses except multiples in the same row
+  SIGNAL keys_double : STD_LOGIC_VECTOR(0 TO 11) := (OTHERS => '0');  --stores multiple key presses in the same row
+  SIGNAL keys_stored : STD_LOGIC_VECTOR(0 TO 11) := (OTHERS => '0');  --final key press values before debounce
+  signal keys    		: STD_LOGIC_VECTOR(0 TO 11):= (OTHERS => '0'); 
+  signal key1 			: std_logic_vector(7 downto 0);
+  signal key2  		: std_logic_vector(7 downto 0);
+  SIGNAL CLK,CLK1,CLK2,CLK3,CLK4,CLK5,CLK6 : STD_LOGIC;
+  signal keypad_frequency     : integer  := 0;
+  signal trigger,d_trig,trig,delay_trigger,edge_trigger :std_logic;	
+ -- signal key_pll  		: std_logic :='0';
+  attribute KEEP : string;
+  attribute KEEP of rows,columns,keys,lcd_rs,lcd_rw,lcd_e,lcd_db : signal is "TRUE";
+
+
+  --declare debouncer component
+  COMPONENT debounce IS
+    GENERIC(
+      clk_freq    : INTEGER;   --system clock frequency in Hz
+      stable_time : INTEGER);  --time button must remain stable in ms
+    PORT(
+      clk         : IN  STD_LOGIC;   --input clock
+      button      : IN  STD_LOGIC;   --input signal to be debounced
+      result      : OUT STD_LOGIC);  --debounced signal
+  END COMPONENT;
+  
+  
+  COMPONENT lcd_controller IS
+	  PORT(
+		 clk        : IN  STD_LOGIC;  --system clock
+		 rw, rs, e  : OUT STD_LOGIC;  --read/write, setup/data, and enable for lcd
+		 lcd_data   : OUT STD_LOGIC_VECTOR(7 DOWNTO 0); --data signals for lcd
+		 key1       : IN STD_LOGIC_VECTOR(7 DOWNTO 0); -- Data for the top line of the LCD
+		 key2       : IN STD_LOGIC_VECTOR(7 DOWNTO 0);
+		 key_pll		: IN  STD_LOGIC;
+		  keypad_frequency :out integer:=0;
+		 trigger    : in std_logic );
+	END COMPONENT;
+
+
+component mcg1
+port
+ (-- Clock in ports
+  CLK_IN1           : in  std_logic;
+  -- Clock out ports
+  CLK_OUT1          : out std_logic;
+  CLK_OUT2          : out  std_logic;
+  CLK_OUT3          : out    std_logic;
+  CLK_OUT4          : out    std_logic;
+  CLK_OUT5          : out    std_logic;
+  CLK_OUT6          : out    std_logic
+ );
+end component;
+
+
+  
+BEGIN
+  
+  --synchronizer flip-flops
+  PROCESS(clk)
+  BEGIN
+    IF(clk'EVENT AND clk = '1') THEN  --rising edge of system clock
+      rows_int <= rows;                 --synchronize the row inputs to the system clock
+    END IF;
+  END PROCESS;
+  
+  PROCESS(clk)--, reset_n
+    VARIABLE count   : INTEGER RANGE 0 TO clk_freq/3_300_000 := 0;  --counter between key press readings
+    VARIABLE presses : INTEGER RANGE 0 TO 12 := 0;                  --count simultaneous detected key presses
+  BEGIN
+
+   IF(clk'EVENT AND clk = '1') THEN     --rising edge of system clock
+      IF(count < clk_freq/3_300_000) THEN     --time for polling change not reached (<300ns)
+        count := count + 1;                     --increment counter
+      ELSE                                    --time for polling change reached (=300ns)
+        count := 0;                             --reset counter
+
+        --cycle through columns to poll for key presses
+        CASE columns IS
+        
+          --pause polling and process results of last cycle of polls
+          WHEN "111111" =>
+            presses := 0;                                         --reset keypress counter
+            press_count: FOR i IN 0 TO 11 LOOP                    --count how many keys were detected as pressed
+              IF(keys_int(i) = '1' OR keys_double(i) = '1') THEN        
+                presses := presses + 1;
+              END IF;
+            END LOOP press_count;
+            IF(presses < 3) THEN                                  --2 or fewer keys pressed
+              keys_stored <= keys_int OR keys_double;               --store results for debounce
+            ELSE                                                  --more than 2 keys pressed
+              keys_stored <= (OTHERS => '0');                       --discard unreliable results
+            END IF;
+            keys_int <= (OTHERS => '0');                          --clear key press buffer for next polling
+            keys_double <= (OTHERS => '0');                       --clear key press buffer for next polling
+            columns <= "011111";
+            
+          --check 1st column single presses per row
+          WHEN "011111" =>
+            keys_int(1) <= NOT rows_int(1);
+            keys_int(7) <= NOT rows_int(2);                        
+            columns <= "101111";
+            
+          --check 2nd column single presses per row
+          WHEN "101111" =>
+            keys_int(2) <= NOT rows_int(1);
+            keys_int(8) <= NOT rows_int(2);
+            columns <= "110111";
+          
+          --check 3rd column single presses per row
+          WHEN "110111" =>
+            keys_int(3) <= NOT rows_int(1);
+            keys_int(9) <= NOT rows_int(2);
+            columns <= "111011";
+          
+          --check 4th column single presses per row
+          WHEN "111011" =>
+            keys_int(4) <= NOT rows_int(1);
+            keys_int(10) <= NOT rows_int(2);
+            columns <= "111101";
+				
+			 --check 5th column single presses per row
+          WHEN "111101" =>
+            keys_int(5) <= NOT rows_int(1);
+            keys_int(11) <= NOT rows_int(2);
+            columns <= "111110";
+			 --check 6th column single presses per row
+          WHEN "111110" =>
+            keys_int(6) <= NOT rows_int(1);
+            keys_int(0) <= NOT rows_int(2);
+            columns <= "001111";  --001111  COL 1ND 2
+          
+          --(TO BE UNCOMMTED LATETR )check 1st and 2nd column dual press per row
+          WHEN "001111" =>            
+            IF(rows_int(1) = '0' AND keys_int(1) = '0' AND keys_int(2) = '0') THEN
+              keys_double(1) <= '1';
+              keys_double(2) <= '1';
+            END IF;
+            IF(rows_int(2) = '0' AND keys_int(7) = '0' AND keys_int(8) = '0') THEN
+              keys_double(7) <= '1';
+              keys_double(8) <= '1';
+            END IF;
+            columns <= "010111";
+          
+          --check 1st and 3rd column dual press per row
+          WHEN "010111" =>
+            IF(rows_int(1) = '0' AND keys_int(1) = '0' AND keys_int(3) = '0') THEN
+              keys_double(1) <= '1';
+              keys_double(3) <= '1';
+            END IF;
+            IF(rows_int(2) = '0' AND keys_int(7) = '0' AND keys_int(9) = '0') THEN
+              keys_double(7) <= '1';
+              keys_double(9) <= '1';
+				END IF;
+           columns <= "011011";
+          
+          --check 1st and 4th column dual press per row
+          WHEN "011011" =>
+            IF(rows_int(1) = '0' AND keys_int(1) = '0' AND keys_int(4) = '0') THEN
+              keys_double(1) <= '1';
+              keys_double(4) <= '1';
+            END IF;
+            IF(rows_int(2) = '0' AND keys_int(7) = '0' AND keys_int(10) = '0') THEN
+              keys_double(7) <= '1';
+              keys_double(10) <= '1';
+            END IF;           
+            columns <= "011101";
+				
+			--check 1st and 5th column dual press per row
+          WHEN "011101" =>
+            IF(rows_int(1) = '0' AND keys_int(1) = '0' AND keys_int(5) = '0') THEN
+              keys_double(1) <= '1';
+              keys_double(5) <= '1';
+            END IF;
+            IF(rows_int(2) = '0' AND keys_int(7) = '0' AND keys_int(11) = '0') THEN
+              keys_double(7) <= '1';
+              keys_double(11) <= '1';
+            END IF;           
+            columns <= "011110";
+				
+			--check 1st and 6th column dual press per row
+          WHEN "011110" =>
+            IF(rows_int(1) = '0' AND keys_int(1) = '0' AND keys_int(6) = '0') THEN
+              keys_double(1) <= '1';
+              keys_double(6) <= '1';
+            END IF;
+            IF(rows_int(2) = '0' AND keys_int(7) = '0' AND keys_int(0) = '0') THEN
+              keys_double(7) <= '1';
+              keys_double(0) <= '1';
+            END IF;           
+            columns <= "100111";
+          
+        ----check 2nd and 3rd column dual press per row
+          WHEN "100111" =>
+            IF(rows_int(1) = '0' AND keys_int(2) = '0' AND keys_int(3) = '0') THEN
+              keys_double(2) <= '1';
+              keys_double(3) <= '1';
+            END IF;
+            IF(rows_int(2) = '0' AND keys_int(8) = '0' AND keys_int(9) = '0') THEN
+              keys_double(8) <= '1';
+              keys_double(9) <= '1';
+            END IF;
+            columns <= "101011";
+          
+          --check 2nd and 4th column dual press per row
+          WHEN "101011" =>
+            IF(rows_int(1) = '0' AND keys_int(2) = '0' AND keys_int(4) = '0') THEN
+              keys_double(2) <= '1';
+              keys_double(4) <= '1';
+            END IF;
+            IF(rows_int(2) = '0' AND keys_int(8) = '0' AND keys_int(10) = '0') THEN
+              keys_double(8) <= '1';
+              keys_double(10) <= '1';
+            END IF;           
+            columns <= "101101";
+          
+			  --check 2nd and 5th column dual press per row
+          WHEN "101101" =>
+            IF(rows_int(1) = '0' AND keys_int(2) = '0' AND keys_int(5) = '0') THEN
+              keys_double(2) <= '1';
+              keys_double(5) <= '1';
+            END IF;
+            IF(rows_int(2) = '0' AND keys_int(8) = '0' AND keys_int(11) = '0') THEN
+              keys_double(8) <= '1';
+              keys_double(11) <= '1';
+            END IF;           
+            columns <= "101110";
+				
+				 --check 2nd and 6th column dual press per row
+          WHEN "101110" =>
+            IF(rows_int(1) = '0' AND keys_int(2) = '0' AND keys_int(6) = '0') THEN
+              keys_double(2) <= '1';
+              keys_double(6) <= '1';
+            END IF;
+            IF(rows_int(2) = '0' AND keys_int(8) = '0' AND keys_int(0) = '0') THEN
+              keys_double(8) <= '1';
+              keys_double(0) <= '1';
+            END IF;           
+            columns <= "110011";
+				
+				 --check 3rd and 4th column dual press per row
+          WHEN "110011" =>
+            IF(rows_int(1) = '0' AND keys_int(3) = '0' AND keys_int(4) = '0') THEN
+              keys_double(3) <= '1';
+              keys_double(4) <= '1';
+            END IF;
+            IF(rows_int(2) = '0' AND keys_int(9) = '0' AND keys_int(10) = '0') THEN
+              keys_double(9) <= '1';
+              keys_double(10) <= '1';
+            END IF;           
+            columns <= "110101";
+				
+				 --check 3rd and 5th column dual press per row
+          WHEN "110101" =>
+            IF(rows_int(1) = '0' AND keys_int(3) = '0' AND keys_int(5) = '0') THEN
+              keys_double(3) <= '1';
+              keys_double(5) <= '1';
+            END IF;
+            IF(rows_int(2) = '0' AND keys_int(9) = '0' AND keys_int(11) = '0') THEN
+              keys_double(9) <= '1';
+              keys_double(11) <= '1';
+            END IF;           
+            columns <= "110110";
+				
+				 --check 3rd and 6th column dual press per row
+          WHEN "110110" =>
+            IF(rows_int(1) = '0' AND keys_int(3) = '0' AND keys_int(6) = '0') THEN
+              keys_double(3) <= '1';
+              keys_double(6) <= '1';
+            END IF;
+            IF(rows_int(2) = '0' AND keys_int(9) = '0' AND keys_int(0) = '0') THEN
+              keys_double(9) <= '1';
+              keys_double(0) <= '1';
+            END IF;           
+            columns <= "111001";
+				
+				 --check 4th and 5th column dual press per row
+         WHEN "111001" =>
+            IF(rows_int(1) = '0' AND keys_int(4) = '0' AND keys_int(5) = '0') THEN
+              keys_double(4) <= '1';
+              keys_double(5) <= '1';
+            END IF;
+            IF(rows_int(2) = '0' AND keys_int(10) = '0' AND keys_int(11) = '0') THEN
+              keys_double(10) <= '1';
+              keys_double(11) <= '1';
+            END IF;           
+            columns <= "111010";
+				
+				 --check 4th and 6th column dual press per row
+          WHEN "111010" =>
+            IF(rows_int(1) = '0' AND keys_int(4) = '0' AND keys_int(6) = '0') THEN
+              keys_double(4) <= '1';
+              keys_double(6) <= '1';
+            END IF;
+            IF(rows_int(2) = '0' AND keys_int(10) = '0' AND keys_int(0) = '0') THEN
+              keys_double(10) <= '1';
+              keys_double(0) <= '1';
+            END IF;           
+            columns <= "111100";
+				
+							 --check 5th and 6th column dual press per row
+          WHEN "111100" =>
+            IF(rows_int(1) = '0' AND keys_int(5) = '0' AND keys_int(6) = '0') THEN
+              keys_double(5) <= '1';
+              keys_double(6) <= '1';
+            END IF;
+            IF(rows_int(2) = '0' AND keys_int(11) = '0' AND keys_int(0) = '0') THEN
+              keys_double(11) <= '1';
+              keys_double(0) <= '1';
+            END IF;           
+            columns <= "111111";
+--          
+          WHEN OTHERS =>
+            columns <= "111111";
+        
+        END CASE;
+        
+      END IF;  
+    END IF;
+  END PROCESS;
+  
+  
+  process(clk)
+  
+  begin
+  
+  if(clk'EVENT AND clk = '1') then
+  --for i in 1 to 12 loop
+     if(keys(1)='1') then
+	  key1<=X"31";
+	  elsif(keys(2)='1') then
+	  key1<=X"32";
+	  elsif(keys(3)='1') then
+	  key1<=X"33";
+	  elsif(keys(4)='1') then
+	  key1<=X"34";
+	  elsif(keys(5)='1') then
+	  key1<=X"35";
+	  elsif(keys(6)='1') then
+	  key1<=X"36";
+	  elsif(keys(7)='1') then
+	  key1<=X"37";
+	  elsif(keys(8)='1') then
+	  key1<=X"38";
+	  elsif(keys(9)='1') then
+	  key1<=X"39";
+	  elsif(keys(10)='1') then
+	  key1<=X"30";
+	  elsif(keys(11)='1') then
+	  key1<=X"2E";
+	  elsif(keys(0)='1') then
+	  key2<=X"0D";
+	  else
+	  trigger<='0';
+	  
+
+	  end if;
+	   trigger<=keys(1)or keys(2)or keys(3)or keys(4)or keys(5)or keys(6)or keys(7)or keys(8)or keys(9)or keys(10) or keys(11);
+
+	-- end loop;
+		if(trigger = '1') then
+		  trig<='1';
+		else
+		  trig<='0';
+			
+		end if; 
+	end if;
+	
+	end process;
+	
+	
+	------------------------------DelayTrigger--------------------------------------
+ Process(CLK)
+
+	BEGIN
+	if(rising_edge(CLK)) then			
+			d_trig<=trig;
+
+	END IF;
+END PROCESS;
+
+------------------------------Edge--Trigger--------------------------------------
+
+ Process(CLK)
+
+	BEGIN
+	if(rising_edge(CLK)) then
+			if((d_trig='0')and(trig ='1')) then			
+					edge_trigger <='1';
+			else
+					edge_trigger <='0';
+			END IF;
+	END IF;
+	
+END PROCESS;
+
+	 
+
+  
+
+  --debounce key press results
+  row_debounce: FOR i IN 0 TO 11 GENERATE
+    debounce_keys: debounce
+      GENERIC MAP(
+		clk_freq => clk_freq, 
+		stable_time => stable_time)
+      PORT MAP(
+		clk => clk,
+		button => keys_stored(i), 
+		result => keys(i)
+		);-- reset_n => reset_n,
+  END GENERATE;
+  
+ -- row_debounce: FOR i IN 0 TO 11 GENERATE
+  LCD: lcd_controller 
+  port map(
+	clk => clk,
+	e => lcd_e,
+	rs => lcd_rs,
+	rw => lcd_rw,
+	lcd_data => lcd_db,
+	key1 => key1,
+	key2 => key2,
+	key_pll =>key_pll,
+	 keypad_frequency=>keypad_frequency,
+	trigger => edge_trigger 
+);		
+--end genrate
+								--reset_n => reset_n,
+
+
+
+------------------------------------------------------------------------------
+-- "Output    Output      Phase     Duty      Pk-to-Pk        Phase"
+-- "Clock    Freq (MHz) (degrees) Cycle (%) Jitter (ps)  Error (ps)"
+------------------------------------------------------------------------------
+-- CLK_OUT1___100.000______0.000______50.0______172.490____235.738
+-- CLK_OUT2____50.000______0.000______50.0______198.618____235.738
+-- CLK_OUT3____40.000______0.000______50.0______207.895____235.738
+-- CLK_OUT4____10.000______0.000______50.0______275.182____235.738
+-- CLK_OUT5_____8.000______0.000______50.0______287.733____235.738
+-- CLK_OUT6_____3.125______0.000______50.0______346.711____235.738
+--
+------------------------------------------------------------------------------
+hundredtofifty : mcg1
+  port map
+   (-- Clock in ports
+    CLK_IN1 => CLK_IN,
+    -- Clock out ports
+    CLK_OUT1 => CLK2,
+    CLK_OUT2 => CLK,
+    CLK_OUT3 => CLK3,
+    CLK_OUT4 => CLK4,
+    CLK_OUT5 => CLK5,
+    CLK_OUT6 => CLK6);
+  
+END logic;
