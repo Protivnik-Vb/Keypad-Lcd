@@ -1,4 +1,4 @@
-# Keypad-Lcd
+# Keypad-Lcd vhdl
 Keypad and Lcd interfaced with fpga:
 ####################Note###################################
 I have implemented keypad with 6 column outputs and 2 Rows inputs with key debouce .Keypad will work with both 3.3v or 5v.
